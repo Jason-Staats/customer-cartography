@@ -1,0 +1,1603 @@
+# ============================================================
+# UCI ONLINE RETAIL - TRANSACTION CLASSIFICATION AND CLEANING
+# ============================================================
+
+# EXECUTION ORDER: 6 OF 10
+# RUN AFTER: invoice_line.sql
+# RUN NEXT: analytical_views.sql
+
+# PREREQUISITES:
+# THE RELATIONAL DATABASE BUILD MUST BE COMPLETE AND VALIDATED.
+# MYSQL 8.0 OR LATER IS REQUIRED FOR COMMON TABLE EXPRESSIONS.
+# BLANK CUSTOMER IDS IN INVOICE MUST HAVE BEEN CONVERTED TO NULL.
+
+# PURPOSE:
+# REVIEW TRANSACTION LINES BEFORE DEFINING CUSTOMER FEATURES.
+# DOCUMENT OBSERVATIONS AND PROPOSED ANALYTICAL RULES.
+# PRESERVE THE EXISTING SOURCE AND MODELED TABLES.
+
+# THIS SCRIPT CONTAINS READ-ONLY INVESTIGATIONS.
+# FILTERS AFFECT QUERY RESULTS ONLY.
+# NO TABLES, VIEWS, OR CLEANED DATASETS ARE CREATED.
+
+# PREVIOUSLY OBSERVED COUNTS DESCRIBE THE REFERENCE DATASET.
+# REVIEW DIFFERENCES IF THE DATA OR BUILD PROCESS CHANGES.
+# VALIDATION COMMENTS DO NOT AUTOMATICALLY STOP EXECUTION.
+
+# BASELINE CUSTOMER PURCHASE CANDIDATES HAVE:
+# - A NON-CANCELLATION INVOICE NUMBER.
+# - POSITIVE QUANTITY.
+# - POSITIVE UNIT PRICE.
+# - A POPULATED CUSTOMER ID.
+
+# EARLY INVESTIGATIONS USE THESE BASELINE CONDITIONS.
+# LATER QUERIES APPLY THE PROPOSED SPECIAL-STOCK-CODE EXCLUSIONS
+# WHERE INDICATED.
+
+# SOURCE QUERIES USE THE VALUES LOADED INTO RETAIL_STG.
+# MODELED QUERIES USE THE SELECTED PRODUCT DESCRIPTION
+# AND THE EARLIEST SOURCE TIMESTAMP ASSIGNED TO EACH INVOICE.
+# EXACT SOURCE DUPLICATES REFER TO LOADED VALUES,
+# NOT THE ORIGINAL TEXT FORMATTING IN THE CSV.
+
+# ANALYTICAL RULES AND THE DOWNSTREAM WORKFLOW ARE SUMMARIZED AT THE END.
+
+USE uci;
+
+
+# PROFILE TRANSACTION LINES BY INVOICE TYPE AND QUANTITY
+# COUNTS REPRESENT INVOICE LINES, NOT DISTINCT INVOICES.
+# EACH LINE BELONGS TO ONE PRICE CATEGORY.
+# MISSING CUSTOMER COUNTS CAN OVERLAP WITH ANY PRICE CATEGORY.
+# DO NOT ADD MISSING CUSTOMER COUNTS TO THE PRICE COUNTS.
+
+SELECT
+    CASE
+        WHEN i.invoice_no LIKE 'C%' THEN 'Cancellation'
+        ELSE 'Non-cancellation'
+    END AS invoice_type,
+    CASE
+        WHEN il.quantity > 0 THEN 'Positive'
+        WHEN il.quantity < 0 THEN 'Negative'
+        WHEN il.quantity = 0 THEN 'Zero'
+        ELSE 'Missing'
+    END AS quantity_status,
+    COUNT(*) AS line_count,
+    SUM(
+        CASE WHEN i.customer_id IS NULL
+             THEN 1 ELSE 0 END
+    ) AS missing_customer_lines,
+    SUM(
+        CASE WHEN il.unit_price > 0
+             THEN 1 ELSE 0 END
+    ) AS positive_price_lines,
+    SUM(
+        CASE WHEN il.unit_price = 0
+             THEN 1 ELSE 0 END
+    ) AS zero_price_lines,
+    SUM(
+        CASE WHEN il.unit_price < 0
+             THEN 1 ELSE 0 END
+    ) AS negative_price_lines,
+    SUM(
+        CASE WHEN il.unit_price IS NULL
+             THEN 1 ELSE 0 END
+    ) AS missing_price_lines
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+GROUP BY
+    invoice_type,
+    quantity_status
+ORDER BY
+    invoice_type,
+    quantity_status;
+
+# PREVIOUSLY OBSERVED:
+
+# CANCELLATION INVOICES:
+# 9288 LINES, ALL WITH NEGATIVE QUANTITIES AND POSITIVE PRICES.
+# 383 OF THESE LINES HAVE MISSING CUSTOMER IDS.
+
+# NON-CANCELLATION INVOICES WITH NEGATIVE QUANTITIES:
+# 1238 LINES, ALL WITH ZERO PRICES AND MISSING CUSTOMER IDS.
+# THESE CHARACTERISTICS ARE CONSISTENT WITH INTERNAL ADJUSTMENTS.
+
+# NON-CANCELLATION INVOICES WITH POSITIVE QUANTITIES:
+# 531271 LINES, OF WHICH 133347 HAVE MISSING CUSTOMER IDS.
+# 530104 HAVE POSITIVE PRICES, 1165 HAVE ZERO PRICES,
+# AND 2 HAVE NEGATIVE PRICES.
+
+# NO ZERO OR MISSING QUANTITIES AND NO MISSING PRICES WERE OBSERVED.
+# THE THREE GROUP COUNTS TOTAL 541797 INVOICE LINES.
+
+
+# INSPECT LINES WITH NEGATIVE UNIT PRICES
+# PRODUCT_DESCRIPTION IS THE SELECTED DESCRIPTION FROM PRODUCT.
+
+SELECT
+    il.invoice_line_id,
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id,
+    i.country,
+    il.stock_code,
+    p.product_description,
+    il.quantity,
+    il.unit_price,
+    il.quantity * il.unit_price AS line_value
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+JOIN product p
+    ON il.stock_code = p.stock_code
+WHERE il.unit_price < 0
+ORDER BY
+    i.invoice_date,
+    i.invoice_no,
+    il.invoice_line_id;
+
+# PREVIOUSLY OBSERVED:
+# TWO LINES USE STOCK CODE B, "Adjust bad debt".
+# BOTH HAVE QUANTITY 1, UNIT PRICE -11062.0600,
+# AND MISSING CUSTOMER IDS.
+# THEIR INVOICE NUMBERS ARE A563186 AND A563187.
+
+# THEY HAVE DIFFERENT INVOICE NUMBERS AND TIMESTAMPS.
+# IDENTICAL AMOUNTS ALONE DO NOT ESTABLISH ACCIDENTAL DUPLICATION.
+
+
+# INSPECT ALL SOURCE RECORDS FOR STOCK CODE B
+# INCLUDE POSITIVE, ZERO, AND NEGATIVE PRICES.
+
+SELECT
+    invoice_no,
+    invoice_date,
+    customer_id,
+    country,
+    stock_code,
+    product_description,
+    quantity,
+    unit_price,
+    quantity * unit_price AS line_value
+FROM retail_stg
+WHERE stock_code = 'B'
+ORDER BY
+    invoice_date,
+    invoice_no,
+    quantity,
+    unit_price;
+
+# PREVIOUSLY OBSERVED:
+# STOCK CODE B HAS THREE SOURCE RECORDS.
+# ALL ARE DESCRIBED AS "Adjust bad debt".
+# ALL HAVE QUANTITY 1 AND MISSING CUSTOMER IDS.
+
+# A563185: 2011-08-12 14:50:00, UNIT PRICE  11062.0600.
+# A563186: 2011-08-12 14:51:00, UNIT PRICE -11062.0600.
+# A563187: 2011-08-12 14:52:00, UNIT PRICE -11062.0600.
+
+# POSITIVE QUANTITY AND PRICE ALONE DO NOT ESTABLISH A PURCHASE.
+# THESE A-PREFIXED INVOICES PASS THE NON-CANCELLATION TEST,
+# WHICH EXCLUDES INVOICE NUMBERS BEGINNING WITH C.
+
+# ANALYTICAL TREATMENT:
+# ALL THREE RECORDS FAIL THE POPULATED CUSTOMER-ID REQUIREMENT.
+# NO ADDITIONAL B FILTER IS NEEDED FOR THE CURRENT CUSTOMER DATASET.
+# PRESERVE THESE RECORDS IN THE SOURCE AND MODELED TABLES.
+
+# THE DESCRIPTION IDENTIFIES BAD-DEBT ACCOUNTING ADJUSTMENTS.
+# IT DOES NOT EXPLAIN THE ACCOUNTING SEQUENCE
+# OR ESTABLISH THAT ANY ENTRY IS ERRONEOUS.
+# REASSESS IF FUTURE B RECORDS HAVE POPULATED CUSTOMER IDS.
+
+
+# PROFILE ZERO-PRICE LINES BY CUSTOMER AVAILABILITY
+# INCLUDE POSITIVE QUANTITIES ON NON-CANCELLATION INVOICES.
+# DISTINCT CUSTOMER COUNTS DO NOT INCLUDE NULL CUSTOMER IDS.
+
+SELECT
+    CASE
+        WHEN i.customer_id IS NULL THEN 'Missing customer ID'
+        ELSE 'Populated customer ID'
+    END AS customer_status,
+    COUNT(*) AS line_count,
+    COUNT(DISTINCT i.invoice_no) AS invoice_count,
+    COUNT(DISTINCT i.customer_id) AS customer_count,
+    COUNT(DISTINCT il.stock_code) AS stock_code_count,
+    SUM(il.quantity) AS total_quantity
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+WHERE i.invoice_no NOT LIKE 'C%'
+    AND il.quantity > 0
+    AND il.unit_price = 0
+GROUP BY customer_status
+ORDER BY customer_status;
+
+# PREVIOUSLY OBSERVED:
+
+# MISSING CUSTOMER ID:
+# 1125 LINES ACROSS 771 INVOICES AND 640 STOCK CODES.
+# TOTAL RECORDED QUANTITY: 58616.
+
+# POPULATED CUSTOMER ID:
+# 40 LINES ACROSS 34 INVOICES, 31 CUSTOMERS, AND 35 STOCK CODES.
+# TOTAL RECORDED QUANTITY: 13884.
+
+# THE TWO LINE COUNTS SUM TO 1165.
+# DISTINCT STOCK-CODE COUNTS MAY OVERLAP BETWEEN GROUPS.
+
+
+# INSPECT ZERO-PRICE LINES ASSOCIATED WITH IDENTIFIED CUSTOMERS
+# PRODUCT_DESCRIPTION IS THE SELECTED DESCRIPTION FROM PRODUCT.
+# SHOW THE LARGEST QUANTITIES FIRST.
+
+SELECT
+    il.invoice_line_id,
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id,
+    i.country,
+    il.stock_code,
+    p.product_description,
+    il.quantity,
+    il.unit_price
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+JOIN product p
+    ON il.stock_code = p.stock_code
+WHERE i.invoice_no NOT LIKE 'C%'
+    AND il.quantity > 0
+    AND il.unit_price = 0
+    AND i.customer_id IS NOT NULL
+ORDER BY
+    il.quantity DESC,
+    i.invoice_no,
+    il.invoice_line_id;
+
+# PREVIOUSLY OBSERVED:
+# ONE LINE ON INVOICE 578841 ACCOUNTS FOR 12540 UNITS,
+# APPROXIMATELY 90.3 PERCENT OF THE 13884 UNITS IN THESE 40 LINES.
+# THE REMAINING 39 LINES TOTAL 1344 UNITS.
+# SIX LINES USE STOCK CODE M WITH SELECTED DESCRIPTION "Manual".
+
+# THE DETAILS DO NOT ESTABLISH WHY THESE PRICES ARE ZERO.
+# DO NOT ASSUME THEY ARE GIFTS, PROMOTIONS, OR RECORDING ERRORS.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# EXCLUDE ZERO-PRICE LINES FROM PURCHASE VALUE, PURCHASE QUANTITY,
+# PRODUCT COUNTS, AND THE LINES USED FOR RECENCY AND FREQUENCY.
+
+# AN INVOICE STILL COUNTS IF IT HAS OTHER QUALIFYING PURCHASE LINES.
+# CUSTOMER ELIGIBILITY DEPENDS ON THEIR ENTIRE PURCHASE HISTORY.
+# PRESERVE ALL SOURCE AND MODELED RECORDS.
+
+
+# CHECK FOR POSITIVE-PRICE CANDIDATES ON THE ZERO-PRICE INVOICES
+# EACH RESULT ROW REPRESENTS ONE INVOICE.
+# THIS CHECK DOES NOT APPLY SPECIAL-STOCK-CODE EXCLUSIONS.
+
+SELECT
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id,
+    SUM(
+        CASE WHEN il.quantity > 0 AND il.unit_price = 0
+             THEN 1 ELSE 0 END
+    ) AS zero_price_lines,
+    SUM(
+        CASE WHEN il.quantity > 0 AND il.unit_price > 0
+             THEN 1 ELSE 0 END
+    ) AS positive_price_lines,
+    SUM(
+        CASE WHEN il.quantity > 0 AND il.unit_price > 0
+             THEN il.quantity * il.unit_price ELSE 0 END
+    ) AS positive_price_value
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+WHERE i.invoice_no NOT LIKE 'C%'
+    AND i.customer_id IS NOT NULL
+GROUP BY
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id
+HAVING zero_price_lines > 0
+ORDER BY
+    positive_price_lines,
+    i.invoice_no;
+
+# PREVIOUSLY OBSERVED:
+# 30 OF THE 34 INVOICES ALSO HAVE POSITIVE-QUANTITY,
+# POSITIVE-PRICE LINES.
+# FOUR HAVE NO SUCH LINES:
+# 543599, 564651, 568384, AND 578841.
+
+# THESE FOUR INVOICES FAIL THE PROPOSED PURCHASE CONDITIONS.
+# THE OTHER 30 REMAIN BASELINE CANDIDATES.
+# THEIR FINAL ELIGIBILITY ALSO DEPENDS ON STOCK-CODE EXCLUSIONS.
+
+
+# CHECK THE FULL HISTORIES OF THE FOUR AFFECTED CUSTOMERS
+# THESE CUSTOMER IDS COME FROM THE REFERENCE-DATA REVIEW.
+# PRESERVE CUSTOMERS WITH NO BASELINE PURCHASE CANDIDATES.
+# SPECIAL-STOCK-CODE AND DUPLICATE POLICIES ARE NOT APPLIED.
+
+SELECT
+    c.customer_id,
+    COUNT(DISTINCT CASE
+        WHEN i.invoice_no NOT LIKE 'C%'
+            AND il.quantity > 0
+            AND il.unit_price > 0
+        THEN i.invoice_no
+    END) AS candidate_purchase_count,
+    COUNT(CASE
+        WHEN i.invoice_no NOT LIKE 'C%'
+            AND il.quantity > 0
+            AND il.unit_price > 0
+        THEN 1
+    END) AS candidate_purchase_lines,
+    MIN(CASE
+        WHEN i.invoice_no NOT LIKE 'C%'
+            AND il.quantity > 0
+            AND il.unit_price > 0
+        THEN i.invoice_date
+    END) AS first_candidate_purchase,
+    MAX(CASE
+        WHEN i.invoice_no NOT LIKE 'C%'
+            AND il.quantity > 0
+            AND il.unit_price > 0
+        THEN i.invoice_date
+    END) AS last_candidate_purchase
+FROM customer c
+LEFT JOIN invoice i
+    ON c.customer_id = i.customer_id
+LEFT JOIN invoice_line il
+    ON i.invoice_no = il.invoice_no
+WHERE c.customer_id IN ('17560', '14646', '12748', '13256')
+GROUP BY c.customer_id
+ORDER BY c.customer_id;
+
+# PREVIOUSLY OBSERVED:
+# CUSTOMER 12748: 209 CANDIDATE INVOICES AND 4595 LINES.
+# CUSTOMER 13256: NO CANDIDATE INVOICES OR LINES.
+# CUSTOMER 14646: 73 CANDIDATE INVOICES AND 2076 LINES.
+# CUSTOMER 17560: 4 CANDIDATE INVOICES AND 26 LINES.
+
+# CUSTOMER 13256 IS OUTSIDE THE PROPOSED PURCHASE COHORT.
+# THE OTHER THREE HAVE BASELINE PURCHASE CANDIDATES.
+# PRESERVE ALL FOUR CUSTOMERS IN THE CUSTOMER TABLE.
+# NULL PURCHASE DATES INDICATE NO QUALIFYING PURCHASE.
+
+
+# PROFILE STOCK CODES CONTAINING NO DIGITS
+# INCLUDE ONLY BASELINE CUSTOMER PURCHASE CANDIDATES.
+# THIS FILTER IDENTIFIES RECORDS FOR REVIEW, NOT EXCLUSION.
+# CODES CONTAINING DIGITS MAY ALSO REPRESENT SPECIAL CHARGES.
+
+SELECT
+    il.stock_code,
+    p.product_description,
+    COUNT(*) AS candidate_purchase_lines,
+    COUNT(DISTINCT i.invoice_no) AS candidate_purchase_invoices,
+    COUNT(DISTINCT i.customer_id) AS customer_count,
+    SUM(il.quantity) AS total_quantity,
+    SUM(il.quantity * il.unit_price) AS total_line_value,
+    MIN(il.unit_price) AS minimum_unit_price,
+    MAX(il.unit_price) AS maximum_unit_price
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+JOIN product p
+    ON il.stock_code = p.stock_code
+WHERE i.invoice_no NOT LIKE 'C%'
+    AND il.quantity > 0
+    AND il.unit_price > 0
+    AND i.customer_id IS NOT NULL
+    AND il.stock_code NOT REGEXP '[0-9]'
+GROUP BY
+    il.stock_code,
+    p.product_description
+ORDER BY
+    total_line_value DESC,
+    il.stock_code;
+
+# PREVIOUSLY OBSERVED:
+# POST: 1099 LINES, TOTAL VALUE 77803.9600.
+# M: 284 LINES, TOTAL VALUE 53779.9300.
+# DOT: 16 LINES, TOTAL VALUE 11906.3600.
+# BANK CHARGES: 12 LINES, TOTAL VALUE 165.0010.
+# PADS: 3 LINES, TOTAL VALUE 0.0030.
+
+# B IS ABSENT BECAUSE ITS RECORDS HAVE MISSING CUSTOMER IDS.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# EXCLUDE POST AND DOT FROM MERCHANDISE PURCHASE FEATURES.
+# THEIR DESCRIPTIONS IDENTIFY POSTAGE CHARGES.
+# PRESERVE THEM FOR SEPARATE SHIPPING OR TOTAL-BILLED ANALYSIS.
+# THIS DOES NOT ASSUME THAT COUNTRY FULLY EXPLAINS POSTAGE CHARGES.
+
+
+# INVESTIGATE ORIGINAL DESCRIPTIONS FOR STOCK CODE M
+# INCLUDE ONLY BASELINE CUSTOMER PURCHASE CANDIDATES.
+# THE SELECTED PRODUCT DESCRIPTION MAY HIDE SOURCE VARIATION.
+
+SELECT
+    r.product_description AS source_description,
+    COUNT(*) AS candidate_purchase_lines,
+    COUNT(DISTINCT r.invoice_no) AS invoice_count,
+    COUNT(DISTINCT r.customer_id) AS customer_count,
+    SUM(r.quantity) AS total_quantity,
+    SUM(r.quantity * r.unit_price) AS total_line_value,
+    MIN(r.unit_price) AS minimum_unit_price,
+    MAX(r.unit_price) AS maximum_unit_price
+FROM retail_stg r
+WHERE r.stock_code = 'M'
+    AND r.invoice_no NOT LIKE 'C%'
+    AND r.quantity > 0
+    AND r.unit_price > 0
+    AND NULLIF(TRIM(r.customer_id), '') IS NOT NULL
+GROUP BY r.product_description
+ORDER BY
+    total_line_value DESC,
+    source_description;
+
+# PREVIOUSLY OBSERVED:
+# ALL 284 CANDIDATE LINES HAVE SOURCE DESCRIPTION "Manual".
+# THEY OCCUR ACROSS 253 INVOICES AND 197 CUSTOMERS.
+# TOTAL RECORDED QUANTITY: 7173.
+# TOTAL LINE VALUE: 53779.9300.
+# UNIT PRICES RANGE FROM 0.0600 TO 4161.0600.
+
+# THE DESCRIPTION DOES NOT IDENTIFY SPECIFIC MERCHANDISE.
+
+
+# INSPECT INVOICE CONTEXT FOR THE FIVE LARGEST CANDIDATE M LINES
+# RANK BY QUANTITY TIMES UNIT PRICE.
+# DISPLAY ALL SOURCE LINES ON THE SELECTED INVOICES.
+# FIVE LINES MAY BELONG TO FEWER THAN FIVE DISTINCT INVOICES.
+# THIS SAMPLE DOES NOT ESTABLISH THE PURPOSE OF ALL M RECORDS.
+
+WITH largest_manual_lines AS (
+    SELECT
+        invoice_no,
+        quantity * unit_price AS manual_line_value
+    FROM retail_stg
+    WHERE stock_code = 'M'
+        AND invoice_no NOT LIKE 'C%'
+        AND quantity > 0
+        AND unit_price > 0
+        AND NULLIF(TRIM(customer_id), '') IS NOT NULL
+    ORDER BY
+        manual_line_value DESC,
+        invoice_no,
+        quantity DESC,
+        unit_price DESC
+    LIMIT 5
+),
+selected_invoices AS (
+    SELECT DISTINCT invoice_no
+    FROM largest_manual_lines
+)
+SELECT
+    r.invoice_no,
+    r.invoice_date,
+    r.customer_id,
+    r.country,
+    r.stock_code,
+    r.product_description,
+    r.quantity,
+    r.unit_price,
+    r.quantity * r.unit_price AS line_value
+FROM retail_stg r
+JOIN selected_invoices s
+    ON r.invoice_no = s.invoice_no
+ORDER BY
+    r.invoice_no,
+    CASE WHEN r.stock_code = 'M' THEN 0 ELSE 1 END,
+    line_value DESC,
+    r.stock_code;
+
+# PREVIOUSLY OBSERVED:
+# THE SELECTED INVOICES RETURNED SIX M RECORDS.
+# INVOICE 571751 CONTAINS TWO M LINES WITH DIFFERENT AMOUNTS.
+# INVOICES 573077 AND 573080 EACH HAVE A 4161.0600 M LINE,
+# BUT HAVE DIFFERENT INVOICE NUMBERS AND TIMESTAMPS.
+# MATCHING AMOUNTS DO NOT ESTABLISH EXACT DUPLICATION.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# EXCLUDE M FROM IDENTIFIABLE MERCHANDISE PURCHASE FEATURES.
+# THE GENERIC DESCRIPTION DOES NOT IDENTIFY WHAT WAS PURCHASED.
+# THESE RECORDS MAY STILL REPRESENT REAL CHARGES OR PURCHASES.
+# PRESERVE THEM FOR SEPARATE ANALYSIS.
+
+
+# MEASURE THE IMPACT OF EXCLUDING M ON ITS CANDIDATE INVOICES
+# INCLUDE ONLY BASELINE CUSTOMER PURCHASE CANDIDATES.
+# OTHER CANDIDATE LINES EXCLUDE M, POST, AND DOT.
+
+# THIS PRESERVES THE SCOPE OF THE INTERMEDIATE REVIEW.
+# BANK CHARGES, PADS, C2, 23444, AND 23574 ARE NOT EXCLUDED HERE.
+# FINAL ELIGIBILITY REQUIRES ALL PROPOSED EXCLUSIONS TOGETHER.
+
+SELECT
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id,
+    SUM(
+        CASE WHEN il.stock_code = 'M'
+             THEN 1 ELSE 0 END
+    ) AS manual_lines,
+    SUM(
+        CASE WHEN il.stock_code = 'M'
+             THEN il.quantity * il.unit_price ELSE 0 END
+    ) AS manual_value,
+    SUM(
+        CASE WHEN il.stock_code NOT IN ('M', 'POST', 'DOT')
+             THEN 1 ELSE 0 END
+    ) AS other_candidate_lines,
+    SUM(
+        CASE WHEN il.stock_code NOT IN ('M', 'POST', 'DOT')
+             THEN il.quantity * il.unit_price ELSE 0 END
+    ) AS other_candidate_value
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+WHERE i.invoice_no NOT LIKE 'C%'
+    AND il.quantity > 0
+    AND il.unit_price > 0
+    AND i.customer_id IS NOT NULL
+GROUP BY
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id
+HAVING manual_lines > 0
+ORDER BY
+    other_candidate_lines,
+    i.invoice_no;
+
+# PREVIOUSLY OBSERVED FROM THE 253 RESULT ROWS:
+# 64 INVOICES HAVE NO OTHER CANDIDATE LINES UNDER THIS FILTER.
+# THEIR 80 M LINES TOTAL 51210.2700.
+
+# 189 INVOICES HAVE OTHER CANDIDATE LINES.
+# THEIR 204 M LINES TOTAL 2569.6600.
+
+# THE GROUPS ACCOUNT FOR ALL 284 CANDIDATE M LINES
+# AND THEIR COMBINED VALUE OF 53779.9300.
+
+# THE 64 INVOICES WOULD NOT COUNT AS PURCHASES UNDER THIS FILTER.
+# THEIR CUSTOMERS MAY HAVE PURCHASES ELSEWHERE IN THEIR HISTORIES.
+
+
+# INSPECT BANK CHARGES AMONG BASELINE PURCHASE CANDIDATES
+# USE ORIGINAL SOURCE DESCRIPTIONS.
+
+SELECT
+    invoice_no,
+    invoice_date,
+    customer_id,
+    country,
+    stock_code,
+    product_description,
+    quantity,
+    unit_price,
+    quantity * unit_price AS line_value
+FROM retail_stg
+WHERE stock_code = 'BANK CHARGES'
+    AND invoice_no NOT LIKE 'C%'
+    AND quantity > 0
+    AND unit_price > 0
+    AND NULLIF(TRIM(customer_id), '') IS NOT NULL
+ORDER BY
+    unit_price DESC,
+    invoice_no,
+    quantity;
+
+# PREVIOUSLY OBSERVED:
+# 12 LINES ACROSS 11 INVOICES AND 10 CUSTOMERS.
+# ALL HAVE DESCRIPTION "Bank Charges" AND QUANTITY 1.
+# ELEVEN LINES HAVE UNIT PRICE 15.0000.
+# ONE LINE HAS UNIT PRICE 0.0010.
+# TOTAL LINE VALUE: 165.0010.
+
+# INVOICE 568375 CONTAINS BOTH A 15.0000 AND A 0.0010 LINE.
+# DIFFERENT PRICES MEAN THESE ARE NOT EXACT DUPLICATE ROWS.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# EXCLUDE BANK CHARGES FROM MERCHANDISE PURCHASE FEATURES.
+# THE DESCRIPTION IDENTIFIES A FINANCIAL CHARGE.
+# PRESERVE THESE RECORDS FOR SEPARATE ANALYSIS.
+
+
+# INSPECT PADS AMONG BASELINE PURCHASE CANDIDATES
+# DO NOT CLASSIFY A CODE SOLELY FROM ITS FORMAT OR LOW PRICE.
+
+SELECT
+    invoice_no,
+    invoice_date,
+    customer_id,
+    country,
+    stock_code,
+    product_description,
+    quantity,
+    unit_price,
+    quantity * unit_price AS line_value
+FROM retail_stg
+WHERE stock_code = 'PADS'
+    AND invoice_no NOT LIKE 'C%'
+    AND quantity > 0
+    AND unit_price > 0
+    AND NULLIF(TRIM(customer_id), '') IS NOT NULL
+ORDER BY
+    invoice_date,
+    invoice_no,
+    quantity,
+    unit_price;
+
+# PREVIOUSLY OBSERVED:
+# THREE LINES, EACH WITH QUANTITY 1 AND UNIT PRICE 0.0010.
+# ALL HAVE DESCRIPTION "PADS TO MATCH ALL CUSHIONS".
+
+# INVOICE 550193: CUSTOMER 13952.
+# INVOICE 561226: CUSTOMER 15618.
+# INVOICE 568200: CUSTOMER 16198.
+
+
+# INSPECT FULL SOURCE INVOICES CONTAINING THE THREE PADS LINES
+# THESE INVOICE NUMBERS COME FROM THE REFERENCE-DATA REVIEW.
+# UPDATE THE LIST IF THE PRECEDING QUERY RETURNS DIFFERENT INVOICES.
+
+SELECT
+    invoice_no,
+    invoice_date,
+    customer_id,
+    stock_code,
+    product_description,
+    quantity,
+    unit_price,
+    quantity * unit_price AS line_value
+FROM retail_stg
+WHERE invoice_no IN ('550193', '561226', '568200')
+ORDER BY
+    invoice_no,
+    CASE WHEN stock_code = 'PADS' THEN 0 ELSE 1 END,
+    stock_code,
+    product_description,
+    unit_price,
+    quantity;
+
+# PREVIOUSLY OBSERVED:
+# ALL THREE INVOICES ALSO CONTAIN OTHER POSITIVE-PRICE MERCHANDISE.
+# TWO INCLUDE SEPARATELY CODED CUSHION FILLER ITEMS WITH LARGER
+# QUANTITIES AND HIGHER UNIT PRICES.
+
+# INTERPRETATION:
+# THE DESCRIPTION, NOMINAL PRICE, AND ACCOMPANYING ITEMS SUGGEST
+# THAT PADS MAY REPRESENT AN ACCESSORY OR ORDER INSTRUCTION.
+# ITS EXACT PURPOSE CANNOT BE ESTABLISHED FROM THESE RECORDS.
+
+# A LINE VALUE OF 0.0010 ROUNDS TO 0.00 AT TWO DECIMAL PLACES.
+# THIS DOES NOT ESTABLISH WHY THAT PRICE WAS USED
+# OR HOW THE ORIGINAL BILLING SYSTEM CALCULATED INVOICE TOTALS.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# EXCLUDE PADS FROM MERCHANDISE PURCHASE FEATURES.
+# THIS IS A MODELING CHOICE BASED ON UNCERTAIN MERCHANDISE MEANING,
+# NOT A FINDING THAT THESE RECORDS ARE ERRONEOUS.
+
+# EXCLUDING THESE THREE LINES REMOVES 0.0030 IN RECORDED VALUE
+# AND THREE RECORDED UNITS FROM PURCHASE FEATURE CALCULATIONS.
+# PADS WILL NOT COUNT AS A DISTINCT MERCHANDISE PRODUCT.
+
+# ALL THREE INVOICES RETAIN OTHER QUALIFYING MERCHANDISE LINES
+# UNDER THE CURRENT PROPOSED RULES.
+# REMOVING THE PADS LINES DOES NOT CHANGE PURCHASE RECENCY
+# OR FREQUENCY UNDER THOSE RULES.
+# PRESERVE ALL SOURCE AND MODELED RECORDS.
+
+
+# IDENTIFY POTENTIALLY SPECIAL STOCK CODES CONTAINING DIGITS
+# INCLUDE ONLY BASELINE CUSTOMER PURCHASE CANDIDATES.
+# USE SOURCE DESCRIPTIONS TO INCLUDE DESCRIPTION VARIATIONS.
+
+# KEYWORD MATCHES ARE INVESTIGATION LEADS, NOT EXCLUSION RULES.
+# THIS SEARCH MAY NOT IDENTIFY EVERY NON-MERCHANDISE RECORD.
+# THE PIPE SYMBOL MEANS OR WITHIN THE REGULAR EXPRESSION.
+# TERMS CAN MATCH PARTS OF WORDS, SUCH AS FEE WITHIN COFFEE.
+
+SELECT
+    stock_code,
+    TRIM(product_description) AS product_description,
+    COUNT(*) AS source_line_count,
+    COUNT(DISTINCT invoice_no) AS invoice_count,
+    COUNT(DISTINCT customer_id) AS customer_count,
+    SUM(quantity) AS total_quantity,
+    SUM(quantity * unit_price) AS total_line_value,
+    MIN(unit_price) AS minimum_unit_price,
+    MAX(unit_price) AS maximum_unit_price
+FROM retail_stg
+WHERE invoice_no NOT LIKE 'C%'
+    AND quantity > 0
+    AND unit_price > 0
+    AND NULLIF(TRIM(customer_id), '') IS NOT NULL
+    AND stock_code REGEXP '[0-9]'
+    AND LOWER(TRIM(product_description)) REGEXP
+        'postage|carriage|shipping|delivery|charge|fee|discount|adjust|manual|debt|credit|refund|commission|gift voucher|gift card'
+GROUP BY
+    stock_code,
+    TRIM(product_description)
+ORDER BY
+    total_line_value DESC,
+    stock_code,
+    product_description;
+
+# PREVIOUSLY OBSERVED:
+
+# C2 - CARRIAGE:
+# 133 CANDIDATE LINES, 133 INVOICES, AND 29 CUSTOMERS.
+# TOTAL RECORDED QUANTITY: 134.
+# TOTAL LINE VALUE: 6686.0000.
+
+# 23444 - Next Day Carriage:
+# 79 CANDIDATE LINES, 79 INVOICES, AND 63 CUSTOMERS.
+# TOTAL RECORDED QUANTITY: 79.
+# TOTAL LINE VALUE: 1200.0000.
+
+# 23574 - PACKING CHARGE:
+# 14 CANDIDATE LINES, 14 INVOICES, AND 9 CUSTOMERS.
+# TOTAL RECORDED QUANTITY: 14.
+# TOTAL LINE VALUE: 105.0000.
+
+# THESE MATCHES TOTAL 226 CANDIDATE LINES AND 7991.0000 IN VALUE.
+# DISTINCT INVOICE AND CUSTOMER COUNTS MAY OVERLAP ACROSS CODES.
+
+# ORDINARY MERCHANDISE ALSO MATCHED:
+# FEE MATCHED COFFEE, TOFFEE, FEEDER, AND FEEDING.
+# CHARGE MATCHED CHARGER.
+# CARRIAGE MATCHED LANTERN AND CLOCK DESCRIPTIONS.
+# THESE MATCHES ALONE PROVIDE NO REASON TO EXCLUDE THOSE PRODUCTS.
+
+# THE C IN STOCK CODE C2 DOES NOT INDICATE CANCELLATION.
+# THE CANCELLATION TEST USES INVOICE_NO, NOT STOCK_CODE.
+
+
+# REVIEW ALL SOURCE DESCRIPTIONS FOR POTENTIAL CHARGE CODES
+# INCLUDE ALL INVOICE TYPES, QUANTITIES, PRICES, AND CUSTOMER STATUSES.
+# CHECK FOR CONFLICTING USES BEFORE EXCLUDING ENTIRE STOCK CODES.
+# COUNTS REPRESENT SOURCE ROWS AND INCLUDE REPEATED OCCURRENCES.
+# SIGNED LINE VALUE INCLUDES POSITIVE AND NEGATIVE AMOUNTS.
+
+SELECT
+    stock_code,
+    NULLIF(TRIM(product_description), '') AS source_description,
+    COUNT(*) AS source_line_count,
+    COUNT(DISTINCT invoice_no) AS invoice_count,
+    COUNT(DISTINCT NULLIF(TRIM(customer_id), '')) AS customer_count,
+    SUM(
+        CASE WHEN invoice_no LIKE 'C%'
+             THEN 1 ELSE 0 END
+    ) AS cancellation_lines,
+    SUM(
+        CASE WHEN NULLIF(TRIM(customer_id), '') IS NULL
+             THEN 1 ELSE 0 END
+    ) AS missing_customer_lines,
+    MIN(unit_price) AS minimum_unit_price,
+    MAX(unit_price) AS maximum_unit_price,
+    SUM(quantity * unit_price) AS signed_line_value
+FROM retail_stg
+WHERE stock_code IN ('C2', '23444', '23574')
+GROUP BY
+    stock_code,
+    NULLIF(TRIM(product_description), '')
+ORDER BY
+    stock_code,
+    source_line_count DESC,
+    source_description;
+
+# PREVIOUSLY OBSERVED:
+# ALL POPULATED SOURCE DESCRIPTIONS IDENTIFY DELIVERY OR PACKING CHARGES.
+# NO CONFLICTING MERCHANDISE DESCRIPTIONS WERE OBSERVED.
+
+# 23444: 80 ROWS DESCRIBED AS "Next Day Carriage",
+# INCLUDING ONE CANCELLATION LINE.
+# 23574: 16 ROWS DESCRIBED AS "PACKING CHARGE",
+# INCLUDING TWO CANCELLATION LINES.
+# C2: 143 ROWS DESCRIBED AS "CARRIAGE",
+# INCLUDING TWO CANCELLATION LINES AND NINE MISSING-CUSTOMER LINES.
+
+# EACH CODE ALSO HAS ONE MISSING-DESCRIPTION ROW
+# WITH A MISSING CUSTOMER ID AND ZERO UNIT PRICE.
+# THESE ROWS ALREADY FAIL THE BASELINE PURCHASE CONDITIONS.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# EXCLUDE C2, 23444, AND 23574 FROM MERCHANDISE PURCHASE FEATURES.
+# CLASSIFY C2 AND 23444 AS DELIVERY CHARGES.
+# CLASSIFY 23574 AS A PACKING CHARGE.
+# APPLY THE SAME EXCLUSIONS TO MERCHANDISE CANCELLATION FEATURES.
+# PRESERVE ALL SOURCE AND MODELED RECORDS.
+# REVIEW THESE CLASSIFICATIONS IF THE SOURCE DATA CHANGES.
+
+
+# MEASURE EXACT DUPLICATE SOURCE ROWS
+# COMPARE ALL EIGHT SOURCE COLUMNS.
+# USE BINARY TEXT COMPARISONS TO PRESERVE CASE AND TRAILING SPACES.
+
+# DUPLICATE GROUPS CONTAIN TWO OR MORE IDENTICAL LOADED ROWS.
+# EXCESS ROWS COUNT OCCURRENCES BEYOND ONE PER GROUP.
+# REPEATED ROWS DO NOT AUTOMATICALLY ESTABLISH RECORDING ERRORS.
+
+WITH duplicate_groups AS (
+    SELECT
+        COUNT(*) AS occurrence_count
+    FROM retail_stg
+    GROUP BY
+        CAST(invoice_no AS BINARY),
+        CAST(stock_code AS BINARY),
+        CAST(product_description AS BINARY),
+        quantity,
+        invoice_date,
+        unit_price,
+        CAST(customer_id AS BINARY),
+        CAST(country AS BINARY)
+    HAVING COUNT(*) > 1
+)
+SELECT
+    COUNT(*) AS duplicate_group_count,
+    COALESCE(SUM(occurrence_count), 0) AS rows_in_duplicate_groups,
+    COALESCE(SUM(occurrence_count - 1), 0) AS excess_duplicate_rows
+FROM duplicate_groups;
+
+# PREVIOUSLY OBSERVED:
+# 4879 GROUPS HAVE IDENTICAL VALUES ACROSS ALL EIGHT SOURCE COLUMNS.
+# THESE GROUPS CONTAIN 10147 SOURCE ROWS.
+# KEEPING ONE OCCURRENCE PER GROUP WOULD REMOVE 5268 EXCESS ROWS.
+
+# SOME GROUPS CONTAIN MORE THAN TWO OCCURRENCES.
+# THE SOURCE DOES NOT PROVIDE A UNIQUE INVOICE-LINE IDENTIFIER.
+# IDENTICAL LOADED VALUES DO NOT PROVE ACCIDENTAL DUPLICATION.
+
+# THESE COUNTS COVER ALL STAGING RECORDS.
+# THEY DO NOT MEASURE THE EFFECT ON QUALIFYING MERCHANDISE PURCHASES.
+
+
+# INSPECT THE MOST FREQUENTLY REPEATED SOURCE ROWS
+# KEEP THE SAME EXACT GROUPING AS THE PRECEDING QUERY.
+# USE MIN TO DISPLAY THE SHARED TEXT VALUE WITHIN EACH GROUP.
+# DISPLAY UP TO 50 DUPLICATE GROUPS.
+# EXCESS SIGNED VALUE DOES NOT ESTABLISH AN OVERCHARGE.
+
+SELECT
+    MIN(invoice_no) AS invoice_no,
+    MIN(stock_code) AS stock_code,
+    MIN(product_description) AS product_description,
+    quantity,
+    invoice_date,
+    unit_price,
+    MIN(customer_id) AS customer_id,
+    MIN(country) AS country,
+    COUNT(*) AS occurrence_count,
+    COUNT(*) - 1 AS excess_rows,
+    (COUNT(*) - 1) * quantity * unit_price AS excess_signed_value
+FROM retail_stg
+GROUP BY
+    CAST(invoice_no AS BINARY),
+    CAST(stock_code AS BINARY),
+    CAST(product_description AS BINARY),
+    quantity,
+    invoice_date,
+    unit_price,
+    CAST(customer_id AS BINARY),
+    CAST(country AS BINARY)
+HAVING COUNT(*) > 1
+ORDER BY
+    occurrence_count DESC,
+    CAST(MIN(invoice_no) AS BINARY),
+    CAST(MIN(stock_code) AS BINARY),
+    invoice_date,
+    quantity,
+    unit_price,
+    CAST(MIN(product_description) AS BINARY),
+    CAST(MIN(customer_id) AS BINARY),
+    CAST(MIN(country) AS BINARY)
+LIMIT 50;
+
+# PREVIOUSLY OBSERVED:
+# INVOICE 555524 HAS 20 IDENTICAL PINK TEACUP LINES
+# AND 12 IDENTICAL GREEN TEACUP LINES, EACH WITH QUANTITY 1.
+# INVOICE 572861 HAS EIGHT IDENTICAL PURPLE DRAWER-KNOB LINES,
+# EACH WITH QUANTITY 12.
+# THE SAMPLE ALSO INCLUDES M LINES ALREADY PROPOSED FOR EXCLUSION.
+
+
+# INSPECT FULL SOURCE INVOICES WITH HIGHLY REPEATED ROWS
+# THESE TWO INVOICES ARE EXAMPLES FROM THE PRECEDING REVIEW.
+# INCLUDE ALL SOURCE OCCURRENCES WITHOUT DISTINCT.
+# THE SORT ORDER DOES NOT REPRESENT ORIGINAL SOURCE ROW ORDER.
+
+SELECT
+    invoice_no,
+    invoice_date,
+    customer_id,
+    country,
+    stock_code,
+    product_description,
+    quantity,
+    unit_price,
+    quantity * unit_price AS line_value
+FROM retail_stg
+WHERE invoice_no IN ('555524', '572861')
+ORDER BY
+    CAST(invoice_no AS BINARY),
+    CAST(stock_code AS BINARY),
+    invoice_date,
+    quantity,
+    unit_price,
+    CAST(product_description AS BINARY),
+    CAST(customer_id AS BINARY),
+    CAST(country AS BINARY);
+
+# PREVIOUSLY OBSERVED:
+# BOTH INVOICES CONTAIN REPEATED AND NONREPEATED MERCHANDISE LINES.
+# INVOICE 555524 ALSO HAS THE SAME STOCK CODE ON LINES
+# WITH DIFFERENT QUANTITIES; THOSE ARE NOT EXACT DUPLICATES.
+
+# THE EIGHT QUANTITY-12 PURPLE DRAWER-KNOB LINES ON 572861
+# REPRESENT 96 RECORDED UNITS IF ALL OCCURRENCES ARE RETAINED,
+# OR 12 UNITS IF ONE OCCURRENCE IS KEPT.
+
+# THE INVOICE CONTEXT DOES NOT ESTABLISH WHICH INTERPRETATION
+# REFLECTS THE ORIGINAL BUSINESS TRANSACTION.
+
+
+# COMPARE ALL OCCURRENCES WITH ONE OCCURRENCE PER EXACT GROUP
+# INCLUDE ONLY PROPOSED MERCHANDISE PURCHASE CANDIDATES.
+# REQUIRE STOCK-CODE MEMBERSHIP IN THE PRODUCT MODEL.
+# APPLY ALL EIGHT PROPOSED SPECIAL-STOCK-CODE EXCLUSIONS.
+
+# GROUP BY ALL EIGHT SOURCE FIELDS USING EXACT TEXT COMPARISONS.
+# INCLUDE SINGLE-OCCURRENCE GROUPS TO MEASURE THE FULL PURCHASE TOTAL.
+# THIS IS A SENSITIVITY COMPARISON, NOT A DATA MODIFICATION.
+
+WITH purchase_groups AS (
+    SELECT
+        r.quantity,
+        r.unit_price,
+        COUNT(*) AS occurrence_count
+    FROM retail_stg r
+    WHERE r.invoice_no NOT LIKE 'C%'
+        AND r.quantity > 0
+        AND r.unit_price > 0
+        AND NULLIF(TRIM(r.customer_id), '') IS NOT NULL
+        AND r.stock_code NOT IN (
+            'POST',
+            'DOT',
+            'M',
+            'BANK CHARGES',
+            'PADS',
+            'C2',
+            '23444',
+            '23574'
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM product p
+            WHERE p.stock_code = r.stock_code
+        )
+    GROUP BY
+        CAST(r.invoice_no AS BINARY),
+        CAST(r.stock_code AS BINARY),
+        CAST(r.product_description AS BINARY),
+        r.quantity,
+        r.invoice_date,
+        r.unit_price,
+        CAST(r.customer_id AS BINARY),
+        CAST(r.country AS BINARY)
+)
+SELECT
+    COALESCE(SUM(occurrence_count), 0) AS lines_all_occurrences,
+    COUNT(*) AS lines_one_per_group,
+    COALESCE(SUM(occurrence_count - 1), 0) AS excess_lines,
+    COALESCE(
+        SUM(CASE WHEN occurrence_count > 1 THEN 1 ELSE 0 END),
+        0
+    ) AS duplicate_groups,
+    COALESCE(
+        SUM(occurrence_count * quantity),
+        0
+    ) AS quantity_all_occurrences,
+    COALESCE(SUM(quantity), 0) AS quantity_one_per_group,
+    COALESCE(
+        SUM((occurrence_count - 1) * quantity),
+        0
+    ) AS excess_quantity,
+    COALESCE(
+        SUM(occurrence_count * quantity * unit_price),
+        0
+    ) AS value_all_occurrences,
+    COALESCE(
+        SUM(quantity * unit_price),
+        0
+    ) AS value_one_per_group,
+    COALESCE(
+        SUM((occurrence_count - 1) * quantity * unit_price),
+        0
+    ) AS excess_value,
+    ROUND(
+        100.0 * SUM((occurrence_count - 1) * quantity * unit_price)
+        / NULLIF(SUM(occurrence_count * quantity * unit_price), 0),
+        4
+    ) AS value_reduction_pct
+FROM purchase_groups;
+
+# PREVIOUSLY OBSERVED UNDER THE PROPOSED MERCHANDISE RULES:
+# RETAINING ALL OCCURRENCES PRODUCES 396244 PURCHASE LINES.
+# KEEPING ONE OCCURRENCE PER EXACT GROUP PRODUCES 391057 LINES.
+# THE DIFFERENCE IS 5187 EXCESS LINES ACROSS 4808 DUPLICATE GROUPS.
+
+# RECORDED QUANTITY WOULD DECREASE BY 15570 UNITS,
+# FROM 5157261 TO 5141691.
+
+# PURCHASE VALUE WOULD DECREASE BY 23839.0100,
+# FROM 8759761.6500 TO 8735922.6400.
+# THIS IS A 0.2721 PERCENT REDUCTION IN PURCHASE VALUE.
+
+# KEEPING ONE OCCURRENCE PRESERVES QUALIFYING INVOICES,
+# CUSTOMERS, PURCHASE DATES, AND DISTINCT STOCK CODES.
+# SPENDING, QUANTITIES, LINE COUNTS, AND AVERAGE ORDER VALUE CAN CHANGE.
+# THESE RESULTS DO NOT ESTABLISH THAT REPEATED ROWS ARE ERRORS.
+
+
+# MEASURE DUPLICATE-POLICY EFFECTS FOR EACH AFFECTED CUSTOMER
+# APPLY THE SAME MERCHANDISE RULES AS THE OVERALL COMPARISON.
+# CALCULATE EACH CUSTOMER'S FULL TOTAL BEFORE FILTERING TO
+# CUSTOMERS WITH REPEATED ROWS.
+# SHOW THE LARGEST PERCENTAGE SPENDING REDUCTIONS FIRST.
+
+WITH purchase_groups AS (
+    SELECT
+        MIN(r.customer_id) AS customer_id,
+        r.quantity,
+        r.unit_price,
+        COUNT(*) AS occurrence_count
+    FROM retail_stg r
+    WHERE r.invoice_no NOT LIKE 'C%'
+        AND r.quantity > 0
+        AND r.unit_price > 0
+        AND NULLIF(TRIM(r.customer_id), '') IS NOT NULL
+        AND r.stock_code NOT IN (
+            'POST',
+            'DOT',
+            'M',
+            'BANK CHARGES',
+            'PADS',
+            'C2',
+            '23444',
+            '23574'
+        )
+        AND EXISTS (
+            SELECT 1
+            FROM product p
+            WHERE p.stock_code = r.stock_code
+        )
+    GROUP BY
+        CAST(r.invoice_no AS BINARY),
+        CAST(r.stock_code AS BINARY),
+        CAST(r.product_description AS BINARY),
+        r.quantity,
+        r.invoice_date,
+        r.unit_price,
+        CAST(r.customer_id AS BINARY),
+        CAST(r.country AS BINARY)
+),
+customer_impact AS (
+    SELECT
+        customer_id,
+        SUM(occurrence_count) AS lines_all_occurrences,
+        COUNT(*) AS lines_one_per_group,
+        SUM(occurrence_count - 1) AS excess_lines,
+        SUM(occurrence_count * quantity) AS quantity_all_occurrences,
+        SUM(quantity) AS quantity_one_per_group,
+        SUM((occurrence_count - 1) * quantity) AS excess_quantity,
+        SUM(
+            occurrence_count * quantity * unit_price
+        ) AS value_all_occurrences,
+        SUM(quantity * unit_price) AS value_one_per_group,
+        SUM(
+            (occurrence_count - 1) * quantity * unit_price
+        ) AS excess_value
+    FROM purchase_groups
+    GROUP BY customer_id
+)
+SELECT
+    customer_id,
+    lines_all_occurrences,
+    lines_one_per_group,
+    excess_lines,
+    quantity_all_occurrences,
+    quantity_one_per_group,
+    excess_quantity,
+    value_all_occurrences,
+    value_one_per_group,
+    excess_value,
+    ROUND(
+        100.0 * excess_value / NULLIF(value_all_occurrences, 0),
+        4
+    ) AS value_reduction_pct
+FROM customer_impact
+WHERE excess_lines > 0
+ORDER BY
+    value_reduction_pct DESC,
+    excess_value DESC,
+    customer_id;
+
+# PREVIOUSLY OBSERVED:
+# 950 CUSTOMERS HAVE REPEATED QUALIFYING MERCHANDISE ROWS.
+# KEEPING ONE OCCURRENCE PER EXACT GROUP WOULD REDUCE PURCHASE VALUE:
+# - BY AT LEAST 10 PERCENT FOR 25 CUSTOMERS.
+# - BY AT LEAST 5 PERCENT FOR 100 CUSTOMERS.
+# - BY AT LEAST 1 PERCENT FOR 565 CUSTOMERS.
+# THESE THRESHOLDS OVERLAP.
+
+# THE LARGEST PERCENTAGE REDUCTION IS 21.3742 FOR CUSTOMER 14974.
+# CUSTOMER-LEVEL DIFFERENCES TOTAL 5187 EXCESS LINES
+# AND 23839.0100 IN VALUE, MATCHING THE OVERALL COMPARISON.
+
+# THE SMALL OVERALL DIFFERENCE DOES NOT IMPLY A SMALL DIFFERENCE
+# FOR EVERY CUSTOMER.
+# THE DATA DOES NOT ESTABLISH WHETHER IDENTICAL SOURCE ROWS
+# ARE ERRORS OR LEGITIMATE REPEATED LINE ENTRIES.
+
+# PROPOSED DUPLICATE POLICY:
+# RETAIN ALL OCCURRENCES IN THE PRIMARY ANALYTICAL PURCHASE DATASET.
+# USE ONE OCCURRENCE PER EXACT SOURCE GROUP AS A SENSITIVITY ALTERNATIVE
+# WHEN ASSESSING CUSTOMER FEATURES AND SEGMENT STABILITY.
+# DO NOT DESCRIBE THAT ALTERNATIVE AS VERIFIED CORRECTED DATA.
+# PRESERVE ALL OCCURRENCES IN THE SOURCE AND MODELED TABLES.
+
+
+# PROFILE CANCELLATIONS FOR IDENTIFIED CUSTOMERS
+# SEPARATE PROPOSED MERCHANDISE LINES FROM EXCLUDED SPECIAL CODES.
+# RETAIN ALL RECORDED OCCURRENCES.
+# INVOICES AND CUSTOMERS MAY APPEAR IN BOTH GROUPS.
+
+# CANCELLATION VALUE IS SHOWN AS A POSITIVE MAGNITUDE
+# FOR NEGATIVE-QUANTITY, POSITIVE-PRICE LINES.
+# THIS DOES NOT ESTABLISH A CASH REFUND OR MATCH TO AN ORIGINAL SALE.
+
+# COMPARE NEGATIVE_QTY_POSITIVE_PRICE_LINES WITH CANCELLATION_LINES
+# BEFORE INTERPRETING THE QUANTITY AND VALUE TOTALS.
+
+SELECT
+    CASE
+        WHEN il.stock_code IN (
+            'POST',
+            'DOT',
+            'M',
+            'BANK CHARGES',
+            'PADS',
+            'C2',
+            '23444',
+            '23574'
+        ) THEN 'Excluded special codes'
+        ELSE 'Merchandise candidates'
+    END AS line_category,
+    COUNT(*) AS cancellation_lines,
+    COUNT(DISTINCT i.invoice_no) AS cancellation_invoices,
+    COUNT(DISTINCT i.customer_id) AS customer_count,
+    SUM(
+        CASE WHEN il.quantity < 0 AND il.unit_price > 0
+             THEN 1 ELSE 0 END
+    ) AS negative_qty_positive_price_lines,
+    SUM(
+        CASE WHEN il.quantity < 0 AND il.unit_price > 0
+             THEN -il.quantity ELSE 0 END
+    ) AS cancelled_quantity,
+    SUM(
+        CASE WHEN il.quantity < 0 AND il.unit_price > 0
+             THEN -il.quantity * il.unit_price ELSE 0 END
+    ) AS cancellation_value
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+WHERE i.invoice_no LIKE 'C%'
+    AND i.customer_id IS NOT NULL
+GROUP BY line_category
+ORDER BY line_category;
+
+# PREVIOUSLY OBSERVED:
+# IDENTIFIED CUSTOMERS HAVE 8905 CANCELLATION LINES.
+
+# MERCHANDISE CANDIDATES:
+# 8629 LINES ACROSS 3462 INVOICES AND 1540 CUSTOMERS.
+# RECORDED CANCELLED QUANTITY: 270691.
+# CANCELLATION VALUE MAGNITUDE: 488002.9800.
+
+# EXCLUDED SPECIAL CODES:
+# 276 LINES ACROSS 253 INVOICES AND 191 CUSTOMERS.
+# RECORDED QUANTITY MAGNITUDE: 4117.
+# CANCELLATION VALUE MAGNITUDE: 123339.1100.
+
+# ALL LINES IN BOTH GROUPS HAVE NEGATIVE QUANTITIES
+# AND POSITIVE UNIT PRICES.
+# DISTINCT INVOICE AND CUSTOMER COUNTS MAY OVERLAP BETWEEN GROUPS.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# USE MERCHANDISE CANDIDATES FOR MERCHANDISE CANCELLATION FEATURES.
+# KEEP SPECIAL-CODE CANCELLATIONS OUT OF THOSE FEATURES.
+# RETAIN ALL OCCURRENCES CONSISTENT WITH THE PROPOSED DUPLICATE POLICY.
+# KEEP CANCELLATION MEASURES SEPARATE FROM PURCHASE SPENDING.
+
+
+# CHECK PURCHASE ELIGIBILITY FOR CUSTOMERS WITH MERCHANDISE CANCELLATIONS
+# APPLY THE SAME STOCK-CODE EXCLUSIONS TO BOTH LINE TYPES.
+# SEARCH EACH CUSTOMER'S ENTIRE AVAILABLE HISTORY.
+#
+# A PURCHASE MAY OCCUR BEFORE OR AFTER A CANCELLATION.
+# THIS CHECK DOES NOT MATCH CANCELLATIONS TO ORIGINAL PURCHASES.
+
+WITH customer_activity AS (
+    SELECT
+        i.customer_id,
+        MAX(
+            CASE
+                WHEN i.invoice_no NOT LIKE 'C%'
+                    AND il.quantity > 0
+                    AND il.unit_price > 0
+                THEN 1 ELSE 0
+            END
+        ) AS has_merchandise_purchase,
+        MAX(
+            CASE
+                WHEN i.invoice_no LIKE 'C%'
+                    AND il.quantity < 0
+                    AND il.unit_price > 0
+                THEN 1 ELSE 0
+            END
+        ) AS has_merchandise_cancellation
+    FROM invoice_line il
+    JOIN invoice i
+        ON il.invoice_no = i.invoice_no
+    WHERE i.customer_id IS NOT NULL
+        AND il.stock_code NOT IN (
+            'POST',
+            'DOT',
+            'M',
+            'BANK CHARGES',
+            'PADS',
+            'C2',
+            '23444',
+            '23574'
+        )
+    GROUP BY i.customer_id
+)
+SELECT
+    CASE
+        WHEN has_merchandise_purchase = 1
+            THEN 'With qualifying merchandise purchases'
+        ELSE 'Without qualifying merchandise purchases'
+    END AS purchase_status,
+    COUNT(*) AS customer_count
+FROM customer_activity
+WHERE has_merchandise_cancellation = 1
+GROUP BY has_merchandise_purchase
+ORDER BY has_merchandise_purchase DESC;
+
+# VALIDATION:
+# THE GROUP COUNTS SHOULD SUM TO THE DISTINCT CUSTOMER COUNT
+# FOR NEGATIVE-QUANTITY, POSITIVE-PRICE MERCHANDISE CANCELLATIONS.
+
+# PREVIOUSLY OBSERVED:
+# 1512 CUSTOMERS HAVE QUALIFYING MERCHANDISE PURCHASES.
+# 28 CUSTOMERS HAVE NO QUALIFYING MERCHANDISE PURCHASES.
+# THE COUNTS SUM TO 1540.
+
+# THE 1512 CUSTOMERS CAN HAVE CANCELLATION FEATURES
+# ALONGSIDE THEIR PURCHASE FEATURES.
+# THE OTHER 28 ARE OUTSIDE THE PROPOSED PURCHASE COHORT.
+
+# THESE COUNTS DESCRIBE CUSTOMERS WITH MERCHANDISE CANCELLATIONS,
+# NOT THE TOTAL SIZE OF THE PURCHASE COHORT.
+# ABSENCE OF AN OBSERVED PURCHASE DOES NOT PROVE
+# THAT A CUSTOMER NEVER MADE A PURCHASE.
+# PRESERVE ALL CUSTOMERS IN THE MODELED CUSTOMER TABLE.
+
+
+# CHECK FOR EARLIER PURCHASES OF THE CANCELLED STOCK CODE
+# INCLUDE IDENTIFIED-CUSTOMER MERCHANDISE CANCELLATIONS.
+# APPLY ALL EIGHT PROPOSED STOCK-CODE EXCLUSIONS.
+# RETAIN ALL RECORDED OCCURRENCES.
+
+# REQUIRE THE SAME CUSTOMER AND STOCK CODE,
+# POSITIVE PURCHASE QUANTITY, POSITIVE PURCHASE PRICE,
+# AND A NON-CANCELLATION PURCHASE INVOICE.
+
+# THE SAME-STOCK REQUIREMENT ALSO ENSURES THE PURCHASE STOCK CODE
+# PASSES THE EXCLUSION LIST APPLIED TO THE CANCELLATION LINE.
+
+# THIS IS AN EXISTENCE CHECK, NOT A MATCH TO AN ORIGINAL SALE.
+# IT DOES NOT MATCH PRICES OR ALLOCATE PURCHASED QUANTITIES.
+# ONE PURCHASE MAY SATISFY THE CHECK FOR MULTIPLE CANCELLATION LINES.
+
+# USE THE MODELED INVOICE TIMESTAMPS.
+# EQUAL TIMESTAMPS DO NOT COUNT AS EARLIER PURCHASES.
+
+WITH cancellation_review AS (
+    SELECT
+        ci.customer_id,
+        ci.invoice_no,
+        cl.quantity,
+        cl.unit_price,
+        CASE
+            WHEN EXISTS (
+                SELECT 1
+                FROM invoice pi
+                JOIN invoice_line pl
+                    ON pi.invoice_no = pl.invoice_no
+                WHERE pi.customer_id = ci.customer_id
+                    AND pl.stock_code = cl.stock_code
+                    AND pi.invoice_no NOT LIKE 'C%'
+                    AND pl.quantity > 0
+                    AND pl.unit_price > 0
+                    AND pi.invoice_date < ci.invoice_date
+            ) THEN 1
+            ELSE 0
+        END AS has_earlier_purchase
+    FROM invoice_line cl
+    JOIN invoice ci
+        ON cl.invoice_no = ci.invoice_no
+    WHERE ci.invoice_no LIKE 'C%'
+        AND ci.customer_id IS NOT NULL
+        AND cl.quantity < 0
+        AND cl.unit_price > 0
+        AND cl.stock_code NOT IN (
+            'POST',
+            'DOT',
+            'M',
+            'BANK CHARGES',
+            'PADS',
+            'C2',
+            '23444',
+            '23574'
+        )
+)
+SELECT
+    CASE
+        WHEN has_earlier_purchase = 1
+            THEN 'Earlier same-stock purchase observed'
+        ELSE 'No earlier same-stock purchase observed'
+    END AS purchase_history_status,
+    COUNT(*) AS cancellation_lines,
+    COUNT(DISTINCT invoice_no) AS cancellation_invoices,
+    COUNT(DISTINCT customer_id) AS customer_count,
+    SUM(-quantity) AS cancelled_quantity,
+    SUM(-quantity * unit_price) AS cancellation_value
+FROM cancellation_review
+GROUP BY has_earlier_purchase
+ORDER BY has_earlier_purchase DESC;
+
+# VALIDATION:
+# THE GROUPS SHOULD RECONCILE TO THE MERCHANDISE CANCELLATION PROFILE.
+# FOR THE CURRENT REFERENCE DATA:
+# - LINE COUNTS SUM TO 8629.
+# - QUANTITIES SUM TO 270691.
+# - VALUES SUM TO 488002.9800.
+# DISTINCT INVOICE AND CUSTOMER COUNTS MAY OVERLAP BETWEEN GROUPS.
+
+# PREVIOUSLY OBSERVED:
+
+# EARLIER SAME-STOCK PURCHASE OBSERVED:
+# 7505 LINES ACROSS 3075 INVOICES AND 1428 CUSTOMERS.
+# CANCELLED QUANTITY: 251428.
+# CANCELLATION VALUE MAGNITUDE: 452173.3400.
+
+# NO EARLIER SAME-STOCK PURCHASE OBSERVED:
+# 1124 LINES ACROSS 569 INVOICES AND 361 CUSTOMERS.
+# CANCELLED QUANTITY: 19263.
+# CANCELLATION VALUE MAGNITUDE: 35829.6400.
+# APPROXIMATELY 13.0 PERCENT OF CANCELLATION LINES
+# AND 7.3 PERCENT OF CANCELLATION VALUE.
+
+# THE 361 CUSTOMERS ARE NOT EQUIVALENT TO THE 28 CUSTOMERS
+# WITH NO QUALIFYING PURCHASES ANYWHERE IN THEIR AVAILABLE HISTORIES.
+# A CUSTOMER MAY HAVE PURCHASED OTHER ITEMS OR PURCHASED LATER.
+
+# AN EARLIER PURCHASE DOES NOT ESTABLISH A MATCHED RETURN.
+# NO EARLIER PURCHASE OBSERVED DOES NOT ESTABLISH AN INVALID RECORD.
+# AN ORIGINAL PURCHASE MAY BE OUTSIDE THE AVAILABLE DATA,
+# BUT THIS CHECK DOES NOT CONFIRM THAT EXPLANATION.
+
+# PROPOSED ANALYTICAL TREATMENT:
+# RETAIN BOTH GROUPS IN OBSERVED MERCHANDISE CANCELLATION MEASURES.
+# KEEP CANCELLATION VALUE SEPARATE FROM PURCHASE SPENDING.
+# DO NOT LABEL THESE MEASURES AS MATCHED RETURNS OR VERIFIED REFUNDS.
+
+# THESE CANCELLATION TOTALS INCLUDE ALL IDENTIFIED CUSTOMERS
+# WITH QUALIFYING MERCHANDISE CANCELLATIONS.
+# TOTALS IN A PURCHASE-COHORT FEATURE TABLE WILL EXCLUDE
+# CANCELLATIONS BELONGING TO THE 28 CUSTOMERS WITHOUT PURCHASES.
+
+
+# SUMMARY OF ANALYTICAL RULES IMPLEMENTED IN analytical_views.sql
+
+# MERCHANDISE PURCHASE LINES:
+# - STOCK CODE RETAINED IN THE PRODUCT MODEL.
+# - NON-CANCELLATION INVOICE NUMBER.
+# - POSITIVE QUANTITY.
+# - POSITIVE UNIT PRICE.
+# - POPULATED CUSTOMER ID.
+# - STOCK CODE OUTSIDE THE EXCLUSION LIST BELOW.
+
+# MERCHANDISE CANCELLATION LINES:
+# - STOCK CODE RETAINED IN THE PRODUCT MODEL.
+# - INVOICE NUMBER BEGINNING WITH C.
+# - NEGATIVE QUANTITY.
+# - POSITIVE UNIT PRICE.
+# - POPULATED CUSTOMER ID.
+# - STOCK CODE OUTSIDE THE SAME EXCLUSION LIST.
+
+# PROPOSED STOCK-CODE EXCLUSIONS:
+# POST AND DOT: POSTAGE CHARGES.
+# C2 AND 23444: DELIVERY CHARGES.
+# 23574: PACKING CHARGES.
+# BANK CHARGES: FINANCIAL CHARGES.
+# M: GENERIC MANUAL ENTRIES WITHOUT IDENTIFIABLE MERCHANDISE.
+# PADS: NOMINAL-PRICE ENTRIES WITH UNCERTAIN MERCHANDISE MEANING.
+
+# THESE ARE EXPLICIT CODE-LEVEL MODELING CHOICES.
+# DO NOT USE CODE FORMAT OR DESCRIPTION KEYWORDS AS AUTOMATIC EXCLUSIONS.
+# REVIEW THE LIST IF THE DATA OR BUSINESS CONTEXT CHANGES.
+
+# THE THREE B RECORDS ALREADY FAIL THE CUSTOMER-ID REQUIREMENT.
+# NO SEPARATE B FILTER IS NEEDED FOR THE CURRENT DATA.
+
+# DUPLICATE POLICY:
+# RETAIN ALL OCCURRENCES IN THE PRIMARY ANALYTICAL DATASET.
+# KEEP ONE OCCURRENCE PER EXACT SOURCE GROUP AS A SENSITIVITY ALTERNATIVE.
+# DO NOT DEDUPLICATE MODELED LINES AS A SUBSTITUTE FOR SOURCE GROUPING.
+
+# PURCHASE COHORT:
+# INCLUDE CUSTOMERS WITH AT LEAST ONE QUALIFYING MERCHANDISE PURCHASE.
+# COUNT DISTINCT QUALIFYING INVOICES FOR PURCHASE FREQUENCY.
+# USE QUALIFYING PURCHASE DATES FOR PURCHASE RECENCY.
+# CALCULATE PURCHASE VALUE FROM QUALIFYING POSITIVE PURCHASE LINES.
+# KEEP CANCELLATION MEASURES SEPARATE.
+
+# AN INVOICE REMAINS A QUALIFYING PURCHASE IF AT LEAST ONE
+# QUALIFYING MERCHANDISE LINE REMAINS.
+# A CUSTOMER REMAINS IN THE PURCHASE COHORT IF AT LEAST ONE
+# QUALIFYING PURCHASE REMAINS IN THE OBSERVATION PERIOD.
+
+# CANCELLATION MEASURES DESCRIBE OBSERVED CANCELLATION ACTIVITY.
+# THEY DO NOT ESTABLISH MATCHED RETURNS, CASH REFUNDS,
+# OR THE PROPORTION OF SPECIFIC PURCHASES THAT WERE RETURNED.
+
+
+# RECONCILE PROPOSED MERCHANDISE PURCHASES IN THE MODELED TABLES
+# APPLY ALL PROPOSED PURCHASE CONDITIONS AND STOCK-CODE EXCLUSIONS.
+# RETAIN ALL RECORDED OCCURRENCES.
+# THIS QUERY DOES NOT CREATE OR CHANGE TABLES.
+
+SELECT
+    COUNT(*) AS purchase_line_count,
+    COUNT(DISTINCT i.invoice_no) AS purchase_invoice_count,
+    COUNT(DISTINCT i.customer_id) AS purchasing_customer_count,
+    COALESCE(SUM(il.quantity), 0) AS purchase_quantity,
+    COALESCE(
+        SUM(il.quantity * il.unit_price),
+        0
+    ) AS purchase_value,
+    MIN(i.invoice_date) AS first_purchase_date,
+    MAX(i.invoice_date) AS last_purchase_date
+FROM invoice_line il
+JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+JOIN product p
+    ON il.stock_code = p.stock_code
+WHERE i.invoice_no NOT LIKE 'C%'
+    AND il.quantity > 0
+    AND il.unit_price > 0
+    AND i.customer_id IS NOT NULL
+    AND il.stock_code NOT IN (
+        'POST',
+        'DOT',
+        'M',
+        'BANK CHARGES',
+        'PADS',
+        'C2',
+        '23444',
+        '23574'
+    );
+
+# VALIDATION:
+# LINE COUNT, QUANTITY, AND VALUE SHOULD MATCH THE STAGING
+# COMPARISON THAT RETAINED ALL QUALIFYING OCCURRENCES.
+
+# PREVIOUSLY OBSERVED FROM STAGING:
+# PURCHASE LINES: 396244.
+# PURCHASE QUANTITY: 5157261.
+# PURCHASE VALUE: 8759761.6500.
+
+# REVIEW ANY DIFFERENCES BEFORE CREATING THE ANALYTICAL DATASET.
+
+
+# RECONCILIATION RESULT:
+# MODELED PURCHASE LINE COUNT, QUANTITY, AND VALUE MATCH
+# THE STAGING COMPARISON THAT RETAINED ALL OCCURRENCES.
+
+# QUALIFYING PURCHASE LINES: 396244.
+# QUALIFYING PURCHASE INVOICES: 18402.
+# PURCHASING CUSTOMERS: 4334.
+# PURCHASE QUANTITY: 5157261.
+# PURCHASE VALUE: 8759761.6500.
+
+# FIRST QUALIFYING PURCHASE: 2010-12-01 08:26:00.
+# LAST QUALIFYING PURCHASE: 2011-12-09 12:50:00.
+
+# THE PROPOSED PURCHASE COHORT CONTAINS 4334 CUSTOMERS.
+# CUSTOMERS OUTSIDE THIS COHORT REMAIN IN THE CUSTOMER TABLE.
+
+
+# CHECK THE FULL SOURCE OBSERVATION RANGE
+# INCLUDE ALL SOURCE RECORDS REGARDLESS OF ANALYTICAL ELIGIBILITY.
+# USE THIS RESULT TO DEFINE THE OBSERVATION CUTOFF
+# AND A COMMON RECENCY REFERENCE DATE.
+
+SELECT
+    MIN(invoice_date) AS first_source_timestamp,
+    MAX(invoice_date) AS last_source_timestamp,
+    DATE_ADD(
+        DATE(MAX(invoice_date)),
+        INTERVAL 1 DAY
+    ) AS proposed_recency_reference_date
+FROM retail_stg;
+
+
+# PREVIOUSLY OBSERVED:
+# FIRST SOURCE TIMESTAMP: 2010-12-01 08:26:00.
+# LAST SOURCE TIMESTAMP: 2011-12-09 12:50:00.
+# THESE MATCH THE QUALIFYING PURCHASE TIMESTAMP RANGE.
+
+# PROPOSED RECENCY DEFINITION:
+# USE 2011-12-10 AS THE COMMON REFERENCE DATE.
+# CALCULATE CALENDAR DAYS FROM EACH CUSTOMER'S LAST
+# QUALIFYING MERCHANDISE PURCHASE TO THAT REFERENCE DATE.
+
+# MYSQL EXPRESSION:
+# DATEDIFF('2011-12-10', last_purchase_date)
+
+# A LAST PURCHASE ON 2011-12-09 HAS RECENCY OF 1 DAY.
+# LOWER RECENCY MEANS A MORE RECENT QUALIFYING PURCHASE.
+
+# THE REFERENCE DATE IS ONE DAY AFTER THE FINAL SOURCE DATE.
+# IT DOES NOT EXTEND THE OBSERVED TRANSACTION PERIOD.
+# THE FINAL SOURCE DAY ENDS AT 12:50 AND MAY BE INCOMPLETE.
+
+# IF THE SOURCE DATA CHANGES, REVIEW THE OBSERVATION PERIOD
+# AND REFERENCE DATE TOGETHER.
+
+
+# BEFORE RUNNING analytical_views.sql:
+# CONFIRM THE PURCHASE AND CANCELLATION CHECKS MATCH
+# THE DOCUMENTED REFERENCE RESULTS.
+# REVIEW THE STOCK-CODE EXCLUSIONS AND DUPLICATE POLICY.
+
+# DOWNSTREAM WORKFLOW:
+# analytical_views.sql CREATES AND VALIDATES THE PURCHASE
+# AND CANCELLATION VIEWS.
+# customer_features.sql CREATES, POPULATES, AND VALIDATES
+# THE CUSTOMER FEATURE SNAPSHOT.
+
+# duplicate_sensitivity.sql PRODUCES THE ALTERNATIVE CUSTOMER
+# FEATURES USING ONE OCCURRENCE PER EXACT SOURCE GROUP.
+# EXPORT THAT RESULT AS customer_features_one_per_group.csv
+# FOR THE NOTEBOOK'S SENSITIVITY COMPARISON.
+
+# FEATURE AND SEGMENT SENSITIVITY TO THE DUPLICATE ALTERNATIVE
+# IS ASSESSED IN retail_pca.ipynb.
+# SEE THE "Sensitivity to repeated source records" SECTION.
+
+# NO STORED RECORDS HAVE BEEN CHANGED OR REMOVED BY THIS SCRIPT.
+# KEEP SOURCE AND MODELED RECORDS AVAILABLE FOR AUDIT AND OTHER ANALYSES.

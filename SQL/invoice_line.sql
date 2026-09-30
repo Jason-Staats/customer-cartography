@@ -1,0 +1,272 @@
+# ============================================================
+# UCI ONLINE RETAIL - INVOICE LINE TABLE
+# ============================================================
+
+# EXECUTION ORDER: 5 OF 10
+# RUN AFTER: product.sql
+# RUN NEXT: transaction_cleaning.sql
+
+# PREREQUISITES:
+# RETAIL_STG, CUSTOMER, INVOICE, AND PRODUCT MUST BE POPULATED.
+# ALL PRIOR VALIDATION CHECKS MUST BE REVIEWED.
+# THE INVOICE_LINE TABLE MUST NOT ALREADY EXIST.
+
+# FRESH BUILD ONLY:
+# IF A STEP FAILS, CHECK WHAT COMPLETED BEFORE RETRYING.
+# RERUNNING THE INSERT CAN DUPLICATE INVOICE LINES.
+
+# THIS SCRIPT:
+# RETAINS SOURCE ROWS WHOSE STOCK CODES EXIST IN PRODUCT.
+# REMOVES INVOICE HEADERS WITH NO RETAINED LINES.
+# ADDS THE INVOICE AND PRODUCT FOREIGN KEYS.
+# RETAIL_STG REMAINS UNCHANGED.
+
+USE uci;
+
+# CREATE INVOICE LINE TABLE
+# ONE ROW PER RETAINED SOURCE ROW.
+# INVOICE_LINE_ID IS GENERATED; IT IS NOT AN ORIGINAL SOURCE LINE NUMBER.
+# CREATE RELATIONSHIP INDEXES BEFORE LOADING DATA AND RUNNING JOINS.
+# EARLIER BUILD ATTEMPTS ENCOUNTERED TIMEOUTS DURING INDEX CREATION
+# ON THE POPULATED TABLE AND DURING INVOICE-HEADER CLEANUP.
+# CREATING THESE INDEXES WITH THE EMPTY TABLE ALLOWED THE REVISED
+# BUILD AND CLEANUP TO COMPLETE SUCCESSFULLY.
+CREATE TABLE invoice_line (
+    invoice_line_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    invoice_no VARCHAR(20),
+    stock_code VARCHAR(20),
+    quantity INT,
+    unit_price DECIMAL(10,4),
+    INDEX idx_invoice_line_invoice_no (invoice_no),
+    INDEX idx_invoice_line_stock_code (stock_code)
+);
+
+
+# COUNT SOURCE ROWS EXCLUDED BY PRODUCT MEMBERSHIP
+# PREVIOUSLY OBSERVED: 112 EXCLUDED SOURCE ROWS.
+SELECT COUNT(*) AS excluded_source_rows
+FROM retail_stg r
+LEFT JOIN product p
+    ON r.stock_code = p.stock_code
+WHERE p.stock_code IS NULL;
+
+
+# IDENTIFY EXCLUDED STOCK CODES
+# PREVIOUSLY OBSERVED: 111 DISTINCT STOCK CODES.
+# EACH RESULT ROW REPRESENTS ONE STOCK CODE.
+# SOURCE_ROW_COUNT VALUES SUM TO THE TOTAL EXCLUDED SOURCE ROW COUNT.
+SELECT
+    r.stock_code,
+    COUNT(*) AS source_row_count
+FROM retail_stg r
+LEFT JOIN product p
+    ON r.stock_code = p.stock_code
+WHERE p.stock_code IS NULL
+GROUP BY r.stock_code
+ORDER BY
+    source_row_count DESC,
+    r.stock_code;
+
+
+# REVIEW EXCLUSIONS AGAINST THE DECISIONS DOCUMENTED IN product.sql.
+# THE DOCUMENTED EXCLUSIONS ARE STOCK CODES WITH NO NONBLANK
+# SOURCE DESCRIPTION AND THE SPECIFIC ADJUSTMENT CODE 23595.
+# INVESTIGATE ANY UNEXPECTED EXCLUSIONS BEFORE CONTINUING.
+
+
+# POPULATE INVOICE LINE TABLE
+# RETAIN EVERY SOURCE ROW WHOSE STOCK CODE EXISTS IN PRODUCT.
+# REPEATED-LOOKING ROWS ARE PRESERVED.
+# RETURNS, CANCELLATIONS, AND ZERO-PRICE ROWS ARE NOT SEPARATELY FILTERED.
+# RERUNNING THIS INSERT CAN DUPLICATE INVOICE LINES.
+INSERT INTO invoice_line (
+    invoice_no,
+    stock_code,
+    quantity,
+    unit_price
+)
+SELECT
+    r.invoice_no,
+    r.stock_code,
+    r.quantity,
+    r.unit_price
+FROM retail_stg r
+INNER JOIN product p
+    ON r.stock_code = p.stock_code;
+
+
+# RECONCILE INVOICE-LINE COUNTS WITH STAGING
+# VALIDATION:
+# ACTUAL_INVOICE_LINE_COUNT MUST EQUAL EXPECTED_INVOICE_LINE_COUNT.
+# STAGING_ROW_COUNT MUST EQUAL EXPECTED_INVOICE_LINE_COUNT
+# PLUS EXCLUDED_SOURCE_ROWS.
+# PREVIOUSLY OBSERVED:
+# 541909 STAGING ROWS = 541797 RETAINED ROWS + 112 EXCLUDED ROWS.
+SELECT
+    (SELECT COUNT(*) FROM retail_stg) AS staging_row_count,
+    (
+        SELECT COUNT(*)
+        FROM retail_stg r
+        INNER JOIN product p
+            ON r.stock_code = p.stock_code
+    ) AS expected_invoice_line_count,
+    (SELECT COUNT(*) FROM invoice_line) AS actual_invoice_line_count,
+    (
+        SELECT COUNT(*)
+        FROM retail_stg r
+        LEFT JOIN product p
+            ON r.stock_code = p.stock_code
+        WHERE p.stock_code IS NULL
+    ) AS excluded_source_rows;
+
+
+# IDENTIFY ORPHAN INVOICE NUMBERS
+# VALIDATION: EXPECTED ZERO ROWS.
+SELECT DISTINCT
+    il.invoice_no
+FROM invoice_line il
+LEFT JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+WHERE i.invoice_no IS NULL
+ORDER BY il.invoice_no;
+
+
+# IDENTIFY ORPHAN STOCK CODES
+# VALIDATION: EXPECTED ZERO ROWS.
+SELECT DISTINCT
+    il.stock_code
+FROM invoice_line il
+LEFT JOIN product p
+    ON il.stock_code = p.stock_code
+WHERE p.stock_code IS NULL
+ORDER BY il.stock_code;
+
+
+# REVIEW INVOICE HEADERS WITH NO RETAINED LINES
+# PREVIOUSLY OBSERVED BEFORE CLEANUP: 112 INVOICE HEADERS.
+SELECT
+    i.invoice_no,
+    i.invoice_date,
+    i.customer_id,
+    i.country
+FROM invoice i
+LEFT JOIN invoice_line il
+    ON i.invoice_no = il.invoice_no
+WHERE il.invoice_no IS NULL
+ORDER BY i.invoice_no;
+
+
+# COUNT INVOICE HEADERS WITH NO RETAINED LINES
+# PREVIOUSLY OBSERVED BEFORE CLEANUP: COUNT VALUE 112.
+# THIS IS AN INVOICE COUNT, SEPARATE FROM THE EXCLUDED SOURCE ROW COUNT.
+SELECT COUNT(*) AS invoices_without_lines
+FROM invoice i
+LEFT JOIN invoice_line il
+    ON i.invoice_no = il.invoice_no
+WHERE il.invoice_no IS NULL;
+
+
+# CHECK FOR UNEXPECTED INVOICE-HEADER DELETION CANDIDATES
+# VALIDATION: EXPECTED ZERO ROWS.
+# FLAG CANDIDATES THAT HAVE:
+# - A POPULATED CUSTOMER ID ON THE HEADER OR ANY SOURCE ROW;
+# - NO ASSOCIATED SOURCE ROWS;
+# - A NONZERO OR MISSING SOURCE UNIT PRICE.
+SELECT
+    i.invoice_no,
+    i.customer_id,
+    s.source_row_count,
+    s.nonzero_price_rows,
+    s.missing_price_rows,
+    s.populated_customer_rows
+FROM invoice i
+LEFT JOIN invoice_line il
+    ON i.invoice_no = il.invoice_no
+LEFT JOIN (
+    SELECT
+        invoice_no,
+        COUNT(*) AS source_row_count,
+        SUM(
+            CASE WHEN unit_price <> 0
+                 THEN 1 ELSE 0 END
+        ) AS nonzero_price_rows,
+        SUM(
+            CASE WHEN unit_price IS NULL
+                 THEN 1 ELSE 0 END
+        ) AS missing_price_rows,
+        SUM(
+            CASE WHEN NULLIF(TRIM(customer_id), '') IS NOT NULL
+                 THEN 1 ELSE 0 END
+        ) AS populated_customer_rows
+    FROM retail_stg
+    GROUP BY invoice_no
+) s
+    ON i.invoice_no = s.invoice_no
+WHERE il.invoice_no IS NULL
+  AND (
+         NULLIF(TRIM(i.customer_id), '') IS NOT NULL
+      OR s.source_row_count IS NULL
+      OR s.nonzero_price_rows > 0
+      OR s.missing_price_rows > 0
+      OR s.populated_customer_rows > 0
+  )
+ORDER BY i.invoice_no;
+
+
+# BEFORE DELETING INVOICE HEADERS:
+# CONFIRM THE LINE COUNTS RECONCILE AND BOTH ORPHAN CHECKS ARE CLEAR.
+# REVIEW THE EXCLUDED STOCK CODES AND INVOICE-HEADER CANDIDATES.
+# CONFIRM THE UNEXPECTED-CANDIDATE CHECK RETURNED ZERO ROWS.
+# STOP AND INVESTIGATE ANY DISCREPANCIES.
+# THESE CHECKS DISPLAY RESULTS; THEY DO NOT AUTOMATICALLY STOP EXECUTION.
+
+
+# MODELING DECISION:
+# REMOVE INVOICE HEADERS WITH NO RETAINED INVOICE LINES
+# AFTER REVIEWING THE CANDIDATES AND VALIDATING THE LINE LOAD.
+# THIS DELETE USES THE ABSENCE OF RETAINED LINES AS ITS CONDITION.
+# RETAIL_STG REMAINS UNCHANGED.
+DELETE i
+FROM invoice i
+LEFT JOIN invoice_line il
+    ON i.invoice_no = il.invoice_no
+WHERE il.invoice_no IS NULL;
+
+
+# VERIFY EVERY REMAINING INVOICE HAS AT LEAST ONE RETAINED LINE
+# VALIDATION: EXPECTED COUNT VALUE 0.
+SELECT COUNT(*) AS invoices_without_lines
+FROM invoice i
+LEFT JOIN invoice_line il
+    ON i.invoice_no = il.invoice_no
+WHERE il.invoice_no IS NULL;
+
+
+# RECHECK FOR ORPHAN INVOICE NUMBERS AFTER CLEANUP
+# VALIDATION: EXPECTED ZERO ROWS.
+SELECT DISTINCT
+    il.invoice_no
+FROM invoice_line il
+LEFT JOIN invoice i
+    ON il.invoice_no = i.invoice_no
+WHERE i.invoice_no IS NULL
+ORDER BY il.invoice_no;
+
+
+# CREATE INVOICE LINE FOREIGN KEY RELATIONSHIPS
+ALTER TABLE invoice_line
+ADD CONSTRAINT fk_invoice_line_invoice
+FOREIGN KEY (invoice_no)
+REFERENCES invoice(invoice_no),
+ADD CONSTRAINT fk_invoice_line_product
+FOREIGN KEY (stock_code)
+REFERENCES product(stock_code);
+
+
+# FINAL BUILD CHECKPOINT:
+# CONFIRM ACTUAL AND EXPECTED INVOICE-LINE COUNTS MATCH.
+# CONFIRM RETAINED AND EXCLUDED SOURCE COUNTS RECONCILE TO STAGING.
+# CONFIRM EVERY REMAINING INVOICE HAS AT LEAST ONE RETAINED LINE.
+# CONFIRM ALL ORPHAN CHECKS RETURNED ZERO ROWS.
+# CONFIRM BOTH INVOICE-LINE FOREIGN KEYS WERE ADDED SUCCESSFULLY.
+# VALIDATION QUERIES DISPLAY RESULTS; THEY DO NOT AUTOMATICALLY STOP EXECUTION.
