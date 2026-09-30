@@ -209,6 +209,14 @@ The SQL queries display results. They do not write these CSV files automatically
 
 Chen, D. (2015). *Online Retail* [Dataset]. UCI Machine Learning Repository. https://doi.org/10.24432/C5BW33
 
+## Licensing
+
+The original project code is licensed under the [MIT License](LICENSE).
+
+The Online Retail dataset by Daqing Chen is provided through the UCI Machine Learning Repository under [Creative Commons Attribution 4.0 International](https://creativecommons.org/licenses/by/4.0/).
+
+The included CSV files are derived from that dataset through the filtering, aggregation, feature engineering, and segmentation steps documented in this repository. The MIT license does not replace the source dataset's license.
+
 ## Author
 
 [Jason Staats](https://github.com/Jason-Staats)
