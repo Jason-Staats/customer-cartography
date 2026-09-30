@@ -1,0 +1,5 @@
+﻿cluster,customers,percent,median_recency_days,median_purchase_frequency,median_purchase_line_count,median_distinct_products,median_purchase_quantity,median_purchase_value,median_average_order_value,median_cancellation_frequency,median_cancellation_line_count,median_distinct_cancelled_products,median_cancelled_quantity,median_cancellation_value
+0,1416,32.69,37.0,3.0,62.0,53.0,546.5,912.595,339.6225,0.0,0.0,0.0,0.0,0.0
+1,436,10.06,13.0,11.0,224.0,133.0,2645.0,4611.360000000001,424.6041,4.0,8.0,7.0,35.0,103.065
+2,1521,35.11,142.0,1.0,13.0,13.0,125.0,226.78,174.9,0.0,0.0,0.0,0.0,0.0
+3,959,22.14,36.0,4.0,66.0,52.0,671.0,1186.35,326.0027,1.0,2.0,2.0,6.0,20.75

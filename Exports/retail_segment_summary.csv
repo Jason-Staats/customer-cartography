@@ -1,0 +1,5 @@
+﻿cluster,segment,customers,purchase_invoices,purchase_value,median_recency_days,customers_with_cancellations,customer_percent,purchase_value_percent,customers_with_cancellations_percent
+0,Recent moderate purchasers and minimal cancellations,1416,5225,2225068.16,37.0,2,32.686980609418285,26.133903872027993,0.14124293785310735
+1,Recent high-activity purchasers and frequent cancellations,436,6712,4325666.88,13.0,436,10.064635272391504,50.805887413505225,100.0
+2,Less recent infrequent purchasers,1521,2078,402361.16,142.0,113,35.11080332409972,4.725818321573427,7.429322813938198
+3,Recent moderate purchasers and some cancellation activity,959,4384,1561009.35,36.0,959,22.13758079409049,18.334390392893354,100.0

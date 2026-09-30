@@ -1,0 +1,5 @@
+﻿cluster,segment,customers,purchase_value,cancellation_value,cancellation_to_purchase_value_percent
+0,Recent moderate purchasers and minimal cancellations,1416,2225068.16,2.9,0.00013033308606600168
+1,Recent high-activity purchasers and frequent cancellations,436,4325666.88,192729.86000000002,4.455494732872264
+2,Less recent infrequent purchasers,1521,402361.16,1792.36,0.4454604912661054
+3,Recent moderate purchasers and some cancellation activity,959,1561009.35,43901.68,2.812390585616928
